@@ -3,140 +3,119 @@ package pqdriver
 import (
 	"context"
 	"fmt"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/tidwall/gjson"
 	"io/ioutil"
 	"log"
-	"os"
 	"strconv"
 	"strings"
 	"time"
 )
 
-type PgxId struct {
-	id *pgx.Conn
+var globalPool *pgxpool.Pool
+
+func init() {
+	globalPool = InitDB()
 }
 
-type ConnectPool struct {
-	dbpool *pgxpool.Pool
-}
-
-/*
-db := InitDB()
-// code
-// ...
-// end code
-defer db.dbpool.Close()
-*/
-func InitDB() *ConnectPool {
-	settings, _ := ioutil.ReadFile("settings.json")
-	user := fmt.Sprintf("%s", gjson.Get(string(settings), "pgUser"))
-	password := fmt.Sprintf("%s", gjson.Get(string(settings), "pgPassword"))
-	port := fmt.Sprintf("%s", gjson.Get(string(settings), "pgPort"))
-	server := fmt.Sprintf("%s", gjson.Get(string(settings), "pgServer"))
-	database := fmt.Sprintf("%s", gjson.Get(string(settings), "pgDataBase"))
-
-	dbpool, err := pgxpool.New(context.Background(), fmt.Sprintf("user=%s password=%s host=%s port=%s dbname=%s sslmode=disable", user, password, server, port, database))
+func InitDB() *pgxpool.Pool {
+	settings, err := ioutil.ReadFile("settings.json")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Unable to create connection pool: %v\n", err)
-		os.Exit(1)
+		log.Fatalf("Failed to read settings.json: %v", err)
 	}
 
-	return &ConnectPool{dbpool: dbpool}
+	connStr := fmt.Sprintf("user=%s password=%s host=%s port=%s dbname=%s sslmode=disable",
+		gjson.GetBytes(settings, "pgUser").String(),
+		gjson.GetBytes(settings, "pgPassword").String(),
+		gjson.GetBytes(settings, "pgServer").String(),
+		gjson.GetBytes(settings, "pgPort").String(),
+		gjson.GetBytes(settings, "pgDataBase").String())
+
+	dbpool, err := pgxpool.New(context.Background(), connStr)
+	if err != nil {
+		log.Fatalf("Unable to create connection pool: %v", err)
+	}
+
+	return dbpool
 }
 
 func DataProc(a string, q string, w string, t []string, e string) {
-	db := InitDB()
+	qColumns := strings.Split(strings.Trim(q, "()"), ", ")
+	whereClause := fmt.Sprintf("%s = %s", qColumns[0], strings.Split(strings.Trim(w, "()"), ", ")[0])
 
-	qSplit := strings.Split(q, ", ")
-	qSplit[0] = strings.ReplaceAll(qSplit[0], "(", "")
-	wSplit := strings.Split(w, ", ")
-	wSplit[0] = strings.ReplaceAll(wSplit[0], "(", "")
-	var sqlOne string
-	for i := 0; i < len(qSplit); i++ {
-		str := strings.ReplaceAll(qSplit[i], "(", "")
-		str = strings.ReplaceAll(str, "'", "")
-		str = strings.ReplaceAll(str, ")", "")
-		if i >= 0 && i < len(qSplit)-1 {
-			sqlOne = sqlOne + str + ", "
-		} else {
-			sqlOne = sqlOne + str
-		}
+	sqlSelect := fmt.Sprintf("SELECT %s FROM %s WHERE %s;", strings.Join(qColumns, ", "), a, whereClause)
+
+	rows, err := globalPool.Query(context.Background(), sqlSelect)
+	if err != nil {
+		log.Println(err)
+		return
 	}
-	sqlExec := "SELECT " + sqlOne + " FROM " + a + " WHERE " + qSplit[0] + " = " + wSplit[0] + ";"
-	rows, _ := db.dbpool.Query(context.Background(), sqlExec)
 	defer rows.Close()
 
-	columnsNameSplit := strings.Split(sqlOne, ", ")
+	wValues := strings.Split(strings.Trim(w, "()"), ", ")
+	edited := make([]bool, len(qColumns))
+	newStr := make([]interface{}, len(qColumns))
 
-	wSplitClear := []string{}
-	for i := 0; i < len(wSplit); i++ {
-		str := strings.ReplaceAll(wSplit[i], "(", "")
-		str = strings.ReplaceAll(str, "'", "")
-		str = strings.ReplaceAll(str, ")", "")
-		wSplitClear = append(wSplitClear, str)
-	}
-
-	edited := []bool{}
-	newStr := []any{}
 	for rows.Next() {
-		varValues, _ := rows.Values()
-		for i := 0; i < len(varValues); i++ {
+		values, _ := rows.Values()
+		for i, v := range values {
 			if t[i] == "int" {
-				nt, _ := strconv.ParseInt(wSplitClear[i], 10, 64)
-				if varValues[i] != nt {
-					edited = append(edited, true)
-					newStr = append(newStr, varValues[i])
-				} else {
-					edited = append(edited, false)
-					newStr = append(newStr, 0)
+				parsedInt, err := strconv.ParseInt(wValues[i], 10, 64)
+				if err != nil {
+					log.Printf("Error parsing string to int for value '%s': %v", wValues[i], err)
+					continue
 				}
+
+				switch vTyped := v.(type) {
+				case int16:
+					if int64(vTyped) != parsedInt {
+						edited[i] = true
+						newStr[i] = v
+					}
+				case int64:
+					if vTyped != parsedInt {
+						edited[i] = true
+						newStr[i] = v
+					}
+				default:
+					log.Printf("Unexpected type for value: %T", v)
+				}
+
 			} else if t[i] == "str" {
-				if varValues[i] != wSplitClear[i] {
-					edited = append(edited, true)
-					newStr = append(newStr, varValues[i])
-				} else {
-					edited = append(edited, false)
-					newStr = append(newStr, 0)
+				if v.(string) != wValues[i] {
+					edited[i] = true
+					newStr[i] = v
 				}
 			}
 		}
+
 	}
-	var ii int
-	for i := 0; i < len(edited); i++ { // update column and add log edit
-		if edited[i] != false && newStr[i] != 0 {
-			//sqlUpdate := "UPDATE " + a + " SET " + columnsNameSplit[i] + " = " + newStr[i] //UPDATE table_name SET column_name = $1 WHERE condition = $2
-			var sqlUpdate string
+	for i, isEdited := range edited {
+		if isEdited {
+			var sqlUpdate, sqlLog string
 			if t[i] == "int" {
-				sqlUpdate = fmt.Sprintf("UPDATE %s SET %s = %d WHERE %s = %s;", a, columnsNameSplit[i], newStr[i], qSplit[0], wSplit[0])
+				sqlUpdate = fmt.Sprintf("UPDATE %s SET %s = $1 WHERE %s;", a, qColumns[i], whereClause)
+				sqlLog = fmt.Sprintf("INSERT INTO editLog (columnEdit, oldDataColumn, newDataColumn, timeEdited) VALUES ('%s', %s, %v, %d);", qColumns[i], wValues[i], newStr[i], time.Now().Unix())
+
 			} else if t[i] == "str" {
-				sqlUpdate = fmt.Sprintf("UPDATE %s SET %s = '%s' WHERE %s = %s;", a, columnsNameSplit[i], newStr[i], qSplit[0], wSplit[0])
+				sqlUpdate = fmt.Sprintf("UPDATE %s SET %s = $1 WHERE %s;", a, qColumns[i], whereClause)
+				sqlLog = fmt.Sprintf("INSERT INTO editLog (columnEdit, oldDataColumn, newDataColumn, timeEdited) VALUES ('%s', %s, '%v', %d);", qColumns[i], wValues[i], newStr[i], time.Now().Unix())
 			}
-			_, err := db.dbpool.Exec(context.Background(), sqlUpdate)
+			_, err := globalPool.Exec(context.Background(), sqlUpdate, newStr[i])
 			if err != nil {
 				log.Println(err)
 			}
-			if t[i] == "int" {
-				nt, _ := strconv.ParseInt(wSplitClear[i], 10, 64)
-				sqlUpdate = fmt.Sprintf("INSERT INTO editLog (columnEdit, oldDataColumn, newDataColumn, timeEdited) VALUES ('%s', %d, %d, %d);", columnsNameSplit[i], nt, newStr[i], time.Now().Unix())
-			} else if t[i] == "str" {
-				sqlUpdate = fmt.Sprintf("INSERT INTO editLog (columnEdit, oldDataColumn, newDataColumn, timeEdited) VALUES ('%s', '%s', '%s', %d);", columnsNameSplit[i], wSplitClear[i], newStr[i], time.Now().Unix())
-			}
-			_, err = db.dbpool.Exec(context.Background(), sqlUpdate)
+			_, err = globalPool.Exec(context.Background(), sqlLog)
 			if err != nil {
 				log.Println(err)
 			}
-			ii++
 		}
 	}
 
-	if rows.Next() == false && ii == 0 { //insert
-		_, err := db.dbpool.Exec(context.Background(), e)
+	if !rows.Next() && len(edited) == 0 {
+		_, err := globalPool.Exec(context.Background(), e)
 		if err != nil {
 			log.Println(err)
 		}
 	}
-	//always from below
-	defer db.dbpool.Close()
 }

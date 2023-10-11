@@ -1,12 +1,10 @@
 package REST_API
 
 import (
-	"fmt"
 	"github.com/tidwall/gjson"
 	"io/ioutil"
 	"log"
 	"net/http"
-	"net/url"
 	"os/exec"
 	"yandex-cloud-data/LOCAL"
 )
@@ -17,33 +15,49 @@ func GetDataFromAPI(folder string, newToken string) {
 		"https://compute.api.cloud.yandex.net/compute/v1/instances/?folderId=",
 		"https://iam.api.cloud.yandex.net/iam/v1/serviceAccounts?folderId=",
 	}
-	var srvcUsrTkn string
-	if newToken == "" {
-		token, _ := ioutil.ReadFile("settings.json")
-		srvcUsrTkn = "Bearer " + fmt.Sprintf("%s", gjson.Get(string(token), "token"))
-	} else {
+
+	tokenData, _ := ioutil.ReadFile("settings.json")
+	defaultToken := gjson.Get(string(tokenData), "token").String()
+	srvcUsrTkn := "Bearer " + defaultToken
+
+	if newToken != "" {
 		srvcUsrTkn = "Bearer " + newToken
 	}
 
-	for i := 0; i < len(sliceURLS); i++ {
-		req, _ := http.NewRequest("GET", sliceURLS[i]+folder, nil)
-		u, _ := url.ParseRequestURI(sliceURLS[i])
-		req.Host = fmt.Sprintf("%s", u.Host)
+	client := &http.Client{}
+
+	for _, apiUrl := range sliceURLS {
+		req, err := http.NewRequest("GET", apiUrl+folder, nil)
+		if err != nil {
+			log.Printf("Error creating request: %s", err)
+			continue
+		}
+
 		req.Header.Add("Authorization", srvcUsrTkn)
 
-		client := &http.Client{}
-		resp, _ := client.Do(req)
-		body, _ := ioutil.ReadAll(resp.Body)
-		if fmt.Sprintf("%s", gjson.Get(string(body), "code")) == "16" {
-			cmd := exec.Command("yc", "iam create-token")
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Printf("Error making request: %s", err)
+			continue
+		}
+		defer resp.Body.Close()
+
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			log.Printf("Error reading response body: %s", err)
+			continue
+		}
+
+		if gjson.Get(string(body), "code").String() == "16" && newToken == "" {
+			cmd := exec.Command("yc", "iam", "create-token")
 			out, err := cmd.Output()
 			if err != nil {
 				log.Println(err)
 			}
 			GetDataFromAPI(folder, string(out))
+			return
 		}
 
 		LOCAL.ControlData(body)
 	}
-
 }
